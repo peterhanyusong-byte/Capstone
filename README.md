@@ -1,10 +1,3 @@
----
-
-editor_options: 
-  markdown: 
-    wrap: 72
----
-
 # Preterm Birth Prediction: Clinical & Environmental Features
 
 End-to-end statistical analysis and machine learning pipeline for predicting preterm birth (gestational age \< 37 weeks) in a Georgia birth cohort, combining clinical/demographic variables with AlphaEarth satellite-derived environmental features.
