@@ -1,0 +1,677 @@
+---
+title: "Preterm Birth Prediction: Clinical & Environmental Features"
+subtitle: "End-to-end analysis: cleaning, EDA, GLM, and Random Forest"
+author: "Hanyu Song"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center",
+  fig.width  = 8,
+  fig.height = 6,
+  dpi        = 150
+)
+```
+
+# Setup
+
+```{r load-packages}
+suppressPackageStartupMessages({
+  # data wrangling & I/O
+  library(tidyverse)
+  library(janitor)
+  library(skimr)
+  # tables & summaries
+  library(gtsummary)
+  library(gt)
+  # plots
+  library(ggcorrplot)
+  library(maps)
+  # modeling
+  library(ranger)
+  library(rsample)
+  library(pROC)
+  library(ResourceSelection)
+  library(lmtest)
+})
+
+here::i_am("codes/full_analysis.Rmd")
+```
+
+```{r ensure-output-dirs, include=FALSE}
+# Make sure expected sub-directories exist (in case this is the first run)
+for (d in c("outputs", "figures", "tables")) {
+  dir_path <- here::here(d)
+  if (!dir.exists(dir_path)) dir.create(dir_path, recursive = TRUE)
+}
+```
+
+---
+
+# Data Cleaning
+
+## Load raw data
+
+```{r load-raw}
+t1_raw <- suppressMessages(read_csv(here::here("data", "EPIC_GA_status.csv")))
+t2_raw <- suppressMessages(read_csv(here::here("data", "pull.v1.csv")))
+```
+
+## Basic cleaning & merge
+
+```{r basic-clean}
+# 1.1 Cleaning t1_raw
+t1 <- t1_raw %>%
+  clean_names() %>%
+  mutate(encounter_nbr = as.character(encounter_nbr)) %>%
+  select(encounter_nbr, admission_date, zip_code, lat, long, score, status)
+
+# 1.2 Cleaning t2_raw
+t2 <- t2_raw %>%
+  clean_names() %>%
+  mutate(encounter_nbr = as.character(encounter_nbr)) %>%
+  select(-x1, -address, -city, -state, -zip_code)
+
+# 1.3 Merge t1 and t2
+data_clean <- t2 %>%
+  left_join(t1, by = "encounter_nbr")
+
+data_clean <- data_clean %>%
+  mutate(
+    across(where(is.character), as.factor),
+    across(c(preterm, obesity, gestht, htn, prom, gestdiab,
+             preecl_s, fgr, diab, preecl_n, nulliparous), as.factor),
+    # set white as reference group
+    race = relevel(race, ref = "White")
+  )
+```
+
+## Missing values summary
+
+```{r missing-summary}
+missing_summary <- data_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(),
+               names_to  = "Variable",
+               values_to = "Missing_Count") %>%
+  mutate(Missing_Percentage = (Missing_Count / nrow(data_clean)) * 100) %>%
+  filter(Missing_Count > 0) %>%
+  arrange(desc(Missing_Count))
+
+missing_summary
+```
+
+## Advanced cleaning
+
+```{r advanced-clean}
+# 2.1 Remove missing values and duplicate encounter_nbr
+data_clean <- data_clean %>%
+  drop_na() %>%
+  distinct(encounter_nbr, .keep_all = TRUE)
+
+# 2.2 Remove the outlier in birth_weight_oz
+data_clean <- data_clean %>%
+  filter(encounter_nbr != "127788738")
+
+# 2.3 Remove the outlier found in group preterm = 0
+outlier_check <- data_clean %>%
+  filter(preterm == "0") %>%
+  arrange(birth_weight_oz) %>%
+  select(encounter_nbr, gest_age, birth_weight_oz) %>%
+  head(10)
+
+outlier_check
+
+data_final_cleaned <- data_clean %>%
+  filter(encounter_nbr != "149794760")
+```
+
+## Save cleaned data
+
+```{r save-cleaned}
+saveRDS(data_final_cleaned, here::here("outputs", "01_dataclean.Rds"))
+write.csv(data_final_cleaned, here::here("outputs", "01_dataclean.csv"),
+          row.names = FALSE)
+```
+
+---
+
+# Exploratory Analysis
+
+## Table 1 — Stratified by race
+
+```{r table1, results='asis'}
+table1 <- data_final_cleaned %>%
+  select(
+    # Demographics
+    race, age, age_cat, hisp, hospital, nulliparous, score,
+    # Clinical risk factors
+    obesity, htn, gestht, diab, gestdiab, preecl_n, preecl_s, prom, fgr,
+    # Outcomes
+    gest_age, birth_weight_oz, preterm
+  ) %>%
+  tbl_summary(
+    by = race,
+    label = list(
+      age            ~ "Maternal Age (years)",
+      age_cat        ~ "Age Category",
+      hisp           ~ "Hispanic Ethnicity",
+      hospital       ~ "Hospital Location",
+      nulliparous    ~ "Nulliparous (First birth)",
+      obesity        ~ "Obesity (BMI >= 30)",
+      htn            ~ "Chronic Hypertension",
+      gestht         ~ "Gestational Hypertension",
+      diab           ~ "Pre-gestational Diabetes",
+      gestdiab       ~ "Gestational Diabetes",
+      preecl_n       ~ "Preeclampsia (Non-severe)",
+      preecl_s       ~ "Severe Preeclampsia",
+      prom           ~ "Premature Rupture of Membranes",
+      fgr            ~ "Fetal Growth Restriction",
+      gest_age       ~ "Gestational Age at Delivery (weeks)",
+      birth_weight_oz ~ "Birth Weight (oz)",
+      preterm        ~ "Preterm Birth (<37 weeks)"
+    ),
+    statistic = list(all_continuous()  ~ "{mean} ({sd})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    missing = "no",
+    digits  = all_continuous() ~ 1
+  ) %>%
+  add_p(
+    test      = list(all_categorical() ~ "chisq.test"),
+    test.args = list(all_categorical() ~ list(simulate.p.value = TRUE))
+  ) %>%
+  add_overall() %>%
+  bold_labels()
+
+table1
+
+# Save the gt version to disk
+table1 %>%
+  as_gt() %>%
+  gt::gtsave(here::here("tables", "02_table1.html"))
+```
+
+## Preterm birth rate by race
+
+```{r preterm-rate-plot, fig.width=12, fig.height=5}
+plot_data <- data_final_cleaned %>%
+  group_by(race) %>%
+  summarise(
+    total         = n(),
+    preterm_count = sum(preterm == "1"),
+    preterm_rate  = preterm_count / total
+  )
+
+preterm_birth_rate_plot <- ggplot(
+  plot_data,
+  aes(x = reorder(race, -preterm_rate), y = preterm_rate, fill = race)
+) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(preterm_rate, accuracy = 0.1)),
+            vjust = -0.5) +
+  labs(title = "Preterm Birth Rates by Race",
+       y = "Preterm Rate", x = "Race") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent) +
+  theme(legend.position = "none", panel.grid = element_blank())
+
+preterm_birth_rate_plot
+
+ggsave(
+  filename = here::here("figures", "02_preterm_rate_plot.png"),
+  plot     = preterm_birth_rate_plot,
+  width    = 15, height = 6, dpi = 300
+)
+```
+
+## Birth weight by preterm status
+
+```{r birth-weight-dist}
+birth_weight_dist_plot <- ggplot(
+  data_final_cleaned,
+  aes(x = preterm, y = birth_weight_oz, fill = preterm)
+) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Birth Weight Distribution by Preterm Status",
+       x = "Preterm (0 = No, 1 = Yes)",
+       y = "Birth Weight (oz)") +
+  theme_classic()
+
+birth_weight_dist_plot
+
+ggsave(
+  filename = here::here("figures", "02_birth_weight_dist_plot.png"),
+  plot     = birth_weight_dist_plot,
+  width    = 8, height = 6, dpi = 300
+)
+```
+
+## Correlation of clinical risk factors
+
+```{r correlation-heatmap}
+cor_data <- data_final_cleaned %>%
+  select(obesity, htn, gestht, diab, gestdiab,
+         preecl_n, preecl_s, prom, fgr) %>%
+  mutate(across(everything(), ~ as.numeric(as.character(.))))
+
+corr_matrix <- cor(cor_data)
+
+clinical_rf_heatmap <- ggcorrplot(
+  corr_matrix,
+  method = "square", type = "lower", lab = TRUE,
+  title  = "Correlation Matrix of Risk Factors"
+) +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+
+clinical_rf_heatmap
+
+ggsave(
+  filename = here::here("figures", "02_clinical_rf_heatmap.png"),
+  plot     = clinical_rf_heatmap,
+  width    = 8, height = 6, dpi = 300
+)
+```
+
+## Spatial distribution of births
+
+```{r spatial-map, fig.width=6, fig.height=8}
+ga_counties <- map_data("county", region = "georgia")
+
+spatial_dis_map <- ggplot() +
+  geom_polygon(
+    data = ga_counties,
+    aes(x = long, y = lat, group = group),
+    fill = "white", color = "black", linewidth = 0.2
+  ) +
+  geom_point(
+    data = data_final_cleaned,
+    aes(x = long, y = lat, color = preterm),
+    alpha = 0.5, size = 0.5
+  ) +
+  labs(title    = "Spatial Distribution of Births",
+       subtitle = "Red points indicate preterm births",
+       color    = "Preterm") +
+  coord_fixed(1.3) +
+  theme_void() +
+  scale_color_manual(values = c("grey80", "red"))
+
+spatial_dis_map
+
+ggsave(
+  filename = here::here("figures", "02_spatial_dis_map.png"),
+  plot     = spatial_dis_map,
+  width    = 6, height = 8, dpi = 300
+)
+```
+
+---
+
+# Logistic Regression (GLM)
+
+## Merge clinical data with AlphaEarth feature `A59`
+
+```{r merge-alphaearth-glm}
+alphaearth_data <- read_csv(
+  here::here("outputs", "Capstone_AlphaEarth_2023_1000m_extracted.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(encounter_nbr = as.character(encounter_nbr)) %>%
+  select(encounter_nbr, A59)
+
+data_all_cleaned <- data_final_cleaned %>%
+  mutate(encounter_nbr = as.character(encounter_nbr)) %>%
+  left_join(alphaearth_data, by = "encounter_nbr")
+
+# set the reference race to white (already done in cleaning, but keep explicit)
+data_all_cleaned$race <- relevel(as.factor(data_all_cleaned$race), ref = "White")
+```
+
+## Base clinical model
+
+```{r glm-base}
+base_model <- glm(
+  preterm ~ preecl_s + age + I(age^2) + fgr + prom + htn + preecl_n +
+    race + diab + hospital + hisp + nulliparous + gestdiab + obesity + gestht,
+  data   = data_all_cleaned,
+  family = binomial(link = "logit")
+)
+
+summary(base_model)
+```
+
+## Clinical model with `htn × obesity` interaction
+
+```{r glm-interaction}
+interaction_model <- glm(
+  preterm ~ preecl_s + age + I(age^2) + fgr + prom + htn + preecl_n +
+    race + diab + hospital + hisp + nulliparous + gestdiab + obesity + gestht +
+    htn:obesity,
+  data   = data_all_cleaned,
+  family = binomial(link = "logit")
+)
+
+summary(interaction_model)
+```
+
+## Clinical + best spatial feature (`A59`) model
+
+```{r glm-spatial}
+spatial_model <- glm(
+  preterm ~ preecl_s + age + I(age^2) + fgr + prom + htn + preecl_n +
+    race + diab + hospital + hisp + nulliparous + gestdiab + obesity + gestht +
+    A59,
+  data   = data_all_cleaned,
+  family = binomial(link = "logit")
+)
+
+summary(spatial_model)
+```
+
+## Likelihood-ratio comparisons
+
+```{r glm-lrtests}
+# Compare clinical vs clinical + interaction
+lrtest(base_model, interaction_model)
+
+# Compare clinical vs clinical + best spatial feature
+lrtest(base_model, spatial_model)
+```
+
+## Table 2 — final spatial model
+
+```{r glm-table2}
+tbl_model <- spatial_model %>%
+  tbl_regression(exponentiate = TRUE) %>%
+  bold_p() %>%
+  add_global_p() %>%
+  bold_labels()
+
+tbl_model
+
+tbl_model %>%
+  as_gt() %>%
+  gt::gtsave(here::here("tables", "03_table2_model.html"))
+```
+
+## Goodness of fit (Hosmer–Lemeshow)
+
+```{r glm-hoslem}
+hoslem.test(spatial_model$y, fitted(spatial_model))
+```
+
+---
+
+# Random Forest
+
+## Build modeling dataset
+
+```{r rf-build-data}
+all_feature_data <- read_csv(
+  here::here("outputs", "Capstone_AlphaEarth_2023_1000m_extracted.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(encounter_nbr = as.character(encounter_nbr))
+
+all_clinical_data <- read_csv(
+  here::here("outputs", "01_dataclean.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(encounter_nbr = as.character(encounter_nbr))
+
+combined_data <- all_clinical_data %>%
+  inner_join(all_feature_data, by = "encounter_nbr") %>%
+  select(-any_of(c(
+    "...1", "encounter_nbr",
+    "gest_age", "age_cat",
+    "birth_weight_oz",
+    "lat", "long", ".geo",
+    "system:index",
+    "zip_code", "score",
+    "status",
+    "admission_date.x", "admission_date.y",
+    "buffer_m", "center_lat", "center_long"
+  ))) %>%
+  mutate(
+    preterm = as.factor(preterm),
+    across(where(is.character), as.factor)
+  )
+
+dim(combined_data)
+head(combined_data)
+```
+
+## Train / test split (stratified on `preterm`)
+
+```{r rf-split}
+set.seed(2026)
+data_split <- initial_split(combined_data, prop = 0.8, strata = preterm)
+
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+dim(train_data)
+dim(test_data)
+
+prop.table(table(train_data$preterm))
+prop.table(table(test_data$preterm))
+```
+
+## Full model (all variables)
+
+```{r rf-full, cache=TRUE}
+n_tree <- 500
+
+rf_model <- ranger(
+  formula     = preterm ~ .,
+  data        = train_data,
+  num.trees   = n_tree,
+  importance  = "impurity",
+  probability = TRUE,
+  seed        = 2026
+)
+
+print(rf_model)
+saveRDS(rf_model,
+        here::here("outputs", paste0("03_rf_full_model_", n_tree, "trees.Rds")))
+```
+
+## Clinical-only model
+
+```{r rf-clinical, cache=TRUE}
+train_data_clinical_only <- train_data %>%
+  select(-starts_with("A", ignore.case = FALSE))
+test_data_clinical_only  <- test_data %>%
+  select(-starts_with("A", ignore.case = FALSE))
+
+dim(train_data_clinical_only)
+dim(test_data_clinical_only)
+
+rf_model_clinical <- ranger(
+  formula     = preterm ~ .,
+  data        = train_data_clinical_only,
+  num.trees   = n_tree,
+  importance  = "impurity",
+  probability = TRUE,
+  seed        = 2026
+)
+
+print(rf_model_clinical)
+saveRDS(rf_model_clinical,
+        here::here("outputs", paste0("03_rf_clinical_model_", n_tree, "trees.Rds")))
+
+# Baseline ROC for DeLong tests
+pred_probs_clinical <- predict(rf_model_clinical, data = test_data_clinical_only)$predictions[, "1"]
+rf_roc_clinical <- roc(test_data_clinical_only$preterm, pred_probs_clinical,
+                       levels = c("0", "1"), quiet = TRUE)
+```
+
+## Search for best single environmental feature
+
+```{r rf-search-best-feature, cache=TRUE}
+spatial_features <- sprintf("A%02d", 0:63)
+
+auc_delong_results <- data.frame(
+  Feature          = character(),
+  AUC              = numeric(),
+  DeLong_Pvalue    = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (feat in spatial_features) {
+  if (feat %in% names(train_data)) {
+
+    temp_train <- train_data %>%
+      select(-starts_with("A", ignore.case = FALSE), all_of(feat))
+    temp_test  <- test_data %>%
+      select(-starts_with("A", ignore.case = FALSE), all_of(feat))
+
+    temp_rf <- ranger(
+      formula     = preterm ~ .,
+      data        = temp_train,
+      num.trees   = n_tree,
+      importance  = "none",
+      probability = TRUE,
+      seed        = 2026
+    )
+
+    temp_preds  <- predict(temp_rf, data = temp_test)$predictions[, "1"]
+    temp_roc    <- roc(test_data$preterm, temp_preds,
+                       levels = c("0", "1"), quiet = TRUE)
+    temp_auc    <- as.numeric(temp_roc$auc)
+    delong_test <- roc.test(rf_roc_clinical, temp_roc, method = "delong")
+
+    auc_delong_results <- rbind(auc_delong_results, data.frame(
+      Feature       = feat,
+      AUC           = temp_auc,
+      DeLong_Pvalue = delong_test$p.value
+    ))
+  }
+}
+
+final_evaluation_board <- auc_delong_results %>%
+  arrange(desc(AUC)) %>%
+  mutate(
+    AUC           = round(AUC, 4),
+    DeLong_Pvalue = round(DeLong_Pvalue, 4),
+    Significant   = ifelse(DeLong_Pvalue < 0.05, "Yes", "No")
+  )
+
+head(final_evaluation_board, 15)
+
+write.csv(final_evaluation_board,
+          here::here("outputs", "03_All_Features_DeLong_Results.csv"),
+          row.names = FALSE)
+```
+
+## Train RF with clinical + best feature
+
+```{r rf-selected, cache=TRUE}
+best_feature <- final_evaluation_board$Feature[1]
+message("Best feature: ", best_feature,
+        " (AUC = ", round(final_evaluation_board$AUC[1], 4), ")")
+
+train_data_selected <- train_data %>%
+  select(-starts_with("A", ignore.case = FALSE), all_of(best_feature))
+test_data_selected  <- test_data %>%
+  select(-starts_with("A", ignore.case = FALSE), all_of(best_feature))
+
+rf_model_selected <- ranger(
+  formula     = preterm ~ .,
+  data        = train_data_selected,
+  num.trees   = n_tree,
+  importance  = "impurity",
+  probability = TRUE,
+  seed        = 2026
+)
+
+saveRDS(rf_model_selected,
+        here::here("outputs", paste0("03_rf_selected_model_", n_tree, "trees.Rds")))
+```
+
+## ROC curve comparison
+
+```{r rf-roc-plot, fig.width=8, fig.height=6}
+# Full model
+preds_probs_full <- predict(rf_model, data = test_data)$predictions[, "1"]
+rf_roc_full <- roc(test_data$preterm, preds_probs_full,
+                   levels = c("0", "1"), quiet = TRUE)
+
+# Clinical + top environmental feature
+pred_probs_selected <- predict(rf_model_selected, data = test_data_selected)$predictions[, "1"]
+rf_roc_selected <- roc(test_data_selected$preterm, pred_probs_selected,
+                       levels = c("0", "1"), quiet = TRUE)
+
+plot(rf_roc_full,     col = "blue",  lwd = 2,
+     main = "ROC Curve Comparison (Preterm Prediction)")
+plot(rf_roc_clinical, col = "red",   lwd = 2, lty = 2, add = TRUE)
+plot(rf_roc_selected, col = "green", lwd = 2, lty = 2, add = TRUE)
+
+legend(
+  "bottomright",
+  legend = c(paste("Full Model (AUC:",     round(rf_roc_full$auc, 3),     ")"),
+             paste("Clinical Model (AUC:", round(rf_roc_clinical$auc, 3), ")"),
+             paste("Clinical + Top Env. (AUC:", round(rf_roc_selected$auc, 3), ")")),
+  col = c("blue", "red", "green"),
+  lty = c(1, 2, 2), lwd = 2
+)
+
+message("Full model AUC: ",                    rf_roc_full$auc)
+message("Clinical Model AUC: ",                rf_roc_clinical$auc)
+message("Clinical + Top Environmental AUC: ",  rf_roc_selected$auc)
+```
+
+## Variable importance
+
+```{r rf-importance}
+importance_df <- data.frame(
+  Feature    = names(rf_model$variable.importance),
+  Importance = as.numeric(rf_model$variable.importance)
+) %>% arrange(desc(Importance))
+head(importance_df, 20)
+
+importance_df_clinical <- data.frame(
+  Feature    = names(rf_model_clinical$variable.importance),
+  Importance = as.numeric(rf_model_clinical$variable.importance)
+) %>% arrange(desc(Importance))
+importance_df_clinical
+
+importance_df_selected <- data.frame(
+  Feature    = names(rf_model_selected$variable.importance),
+  Importance = as.numeric(rf_model_selected$variable.importance)
+) %>% arrange(desc(Importance))
+importance_df_selected
+```
+
+## DeLong tests
+
+```{r rf-delong-tests}
+# Clinical vs Full
+roc_compare_1 <- roc.test(rf_roc_clinical, rf_roc_full, method = "delong")
+roc_compare_1
+
+# Clinical vs Clinical + Top environmental
+roc_compare_2 <- roc.test(rf_roc_clinical, rf_roc_selected, method = "delong")
+roc_compare_2
+```
+
+---
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
